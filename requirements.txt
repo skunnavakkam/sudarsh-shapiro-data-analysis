@@ -1,0 +1,7 @@
+argparse
+cellpose
+scipy
+scikit-image
+matplotlib
+numpy
+pandas
