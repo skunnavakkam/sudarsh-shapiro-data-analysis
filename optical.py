@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from cellpose import models
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
+import torch
 
 
 def load_image_stack(path):
@@ -16,9 +17,9 @@ def run_cellpose_on_stack(stack, channels=[0, 0], diameter=30):
     img = stack[0]
     img = (img - img.min()) / (img.max() - img.min())
 
-    model = models.Cellpose(model_type="cyto", gpu=True)
+    model = models.CellposeModel(model_type="cyto", device=torch.device("mps"))
 
-    mask, flows, styles, diams = model.eval(
+    mask, flows, styles = model.eval(
         img,
         diameter=diameter,
         channels=channels,
@@ -26,7 +27,7 @@ def run_cellpose_on_stack(stack, channels=[0, 0], diameter=30):
         cellprob_threshold=0.0,
     )
 
-    return mask, flows, styles, diams
+    return mask, flows, styles
 
 
 def get_average_cell_frequencies(window_size, image_stack, mask):
@@ -49,7 +50,7 @@ def get_average_cell_frequencies(window_size, image_stack, mask):
         cell_trace = gaussian_filter1d(cell_trace, sigma=0.25)
 
         # Find peaks in the trace
-        peaks, _ = find_peaks(cell_trace, prominence=25)
+        peaks, _ = find_peaks(cell_trace, prominence=0.05 * cell_trace.mean())
 
         # Store total spikes for this cell
         total_spikes[cell_id - 1] = len(peaks)
@@ -151,7 +152,7 @@ def main():
     args = parser.parse_args()
 
     image_stack = load_image_stack(args.path)
-    mask, _, _, _ = run_cellpose_on_stack(image_stack)
+    mask, _, _ = run_cellpose_on_stack(image_stack)
 
     mean, stderr = get_average_cell_frequencies(100, image_stack, mask)
 
