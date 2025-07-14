@@ -1,11 +1,7 @@
 import numpy as np
 from skimage.io import imread
 import matplotlib.pyplot as plt
-from skimage import filters, morphology, measure, feature, segmentation
-from skimage.feature import blob_log
-from scipy import ndimage
 import warnings
-import tqdm
 from skimage.color import label2rgb
 from scipy.ndimage import gaussian_filter1d
 from skimage.measure import regionprops
@@ -219,7 +215,7 @@ def analyze_spikes(
     smooth_sigma: float = 2.0,
     prominence: float = 10,
     amplitude_thresh: float = 0.1,
-    fit_thresh: float = 0.7,
+    fit_thresh: float = 0.9,
     plot: bool = True,
     plot_fraction: float = 0.2,
 ) -> tuple[list[list[tuple[list[float], list[float], list[float]]]], list[CellStats]]:
@@ -366,6 +362,9 @@ def analyze_spikes(
                 # Plot fits
                 for fit_params, t_seg, y_fit in segment_fits:
                     ax.plot(t_seg, y_fit, "m-", alpha=0.5)
+            else:
+                # Color background light red if no spikes detected
+                ax.set_facecolor("#ffeded")
             ax.set_title(f"Cell {cell_idx + 1} - {stats['n_spikes']} spikes detected")
             ax.set_xlabel("Time (s)")
             ax.set_ylabel("Intensity")
@@ -391,6 +390,10 @@ if __name__ == "__main__":
 
     generate_time_series_plot(cell_intensities)
     fits, stats = analyze_spikes(cell_intensities)
+
+    # Check for cells with no spikes detected
+    cells_with_no_spikes = sum(1 for stat in stats if stat["n_spikes"] == 0)
+    print(f"\nNumber of cells with no spikes detected: {cells_with_no_spikes}")
 
     tau_mean = [stats["tau_mean"] for stats in stats]
     tau_std = [stats["tau_std"] for stats in stats]
