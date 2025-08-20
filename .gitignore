@@ -2,3 +2,6 @@
 analysis*
 images/
 __pycache__/
+results/
+logs/
+cache/

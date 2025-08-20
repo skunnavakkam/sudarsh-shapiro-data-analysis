@@ -6,6 +6,15 @@ from cellpose import models
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 import torch
+from typing import List, Union, Optional
+import os
+from datetime import datetime
+
+
+device = torch.device("cpu")
+
+torch.set_num_threads(8)
+torch.set_num_interop_threads(8)
 
 
 def load_image_stack(path):
@@ -13,11 +22,11 @@ def load_image_stack(path):
     return np.array(image_stack)
 
 
-def run_cellpose_on_stack(stack, channels=[0, 0], diameter=30):
+def run_cellpose_on_stack(stack, channels=[0, 0], diameter=30, save_dir=None):
     img = stack[0]
     img = (img - img.min()) / (img.max() - img.min())
 
-    model = models.CellposeModel(model_type="cyto", device=torch.device("mps"))
+    model = models.CellposeModel(model_type="cyto", device=device)
 
     mask, flows, styles = model.eval(
         img,
@@ -26,6 +35,11 @@ def run_cellpose_on_stack(stack, channels=[0, 0], diameter=30):
         flow_threshold=0.4,
         cellprob_threshold=0.0,
     )
+
+    if save_dir:
+        # Create side-by-side comparison of original and segmented images
+        comparison = np.hstack((img, mask))
+        io.imsave(os.path.join(save_dir, "_segmentation.png"), comparison)
 
     return mask, flows, styles
 
@@ -120,19 +134,40 @@ def get_cell_frequency_distribution(image_stack, mask):
     return np.array(cell_frequencies)
 
 
-def plot_cell_frequencies(mean, stderr):
+def plot_cell_frequencies(
+    mean: Union[List[float], List[List[float]]],
+    stderr: Union[List[float], List[List[float]]],
+    labels: Optional[List[str]] = None,
+    path: Optional[str] = None,
+):
     plt.figure(figsize=(10, 6))
-    plt.plot(mean, "b-", label="Weighted mean (norm.)")
-    plt.fill_between(
-        np.arange(len(mean)),
-        mean - stderr,
-        mean + stderr,
-        color="b",
-        alpha=0.2,
-        label="±1 SEM",
-    )
+    if isinstance(mean, list):
+        # Plot multiple frequencies if mean is a list of lists
+        for i, (m, s) in enumerate(zip(mean, stderr)):
+            plt.plot(m, label=labels[i])
+            plt.fill_between(
+                np.arange(len(m)),
+                np.array(m) - np.array(s),
+                np.array(m) + np.array(s),
+                alpha=0.2,
+            )
+    else:
+        # Plot single frequency if mean is a single list
+        plt.plot(mean, "b-", label="Weighted mean (norm.)")
+        plt.fill_between(
+            np.arange(len(mean)),
+            mean - stderr,
+            mean + stderr,
+            color="b",
+            alpha=0.2,
+            label="±1 SEM",
+        )
     plt.legend()
-    plt.show()
+    if path:
+        plt.savefig(path)
+    else:
+        plt.show()
+    plt.close()
 
 
 def plot_frequency_distribution(frequencies):
@@ -147,16 +182,56 @@ def plot_frequency_distribution(frequencies):
 def main():
     parser = argparse.ArgumentParser(description="Process ultrasound images")
     parser.add_argument(
-        "--path", type=str, required=True, help="Path to the ultrasound image stack"
+        "--path",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Path(s) to the ultrasound image stack(s)",
     )
+
     args = parser.parse_args()
 
-    image_stack = load_image_stack(args.path)
-    mask, _, _ = run_cellpose_on_stack(image_stack)
+    # Create results directory with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = args.path[0].replace(".", "+") + "_" + timestamp
+    os.makedirs(results_dir, exist_ok=True)
 
-    mean, stderr = get_average_cell_frequencies(100, image_stack, mask)
+    if len(args.path) == 1:
+        image_stack = load_image_stack(args.path[0])
+        mask, _, _ = run_cellpose_on_stack(image_stack)
 
-    frequencies = get_cell_frequency_distribution(image_stack, mask)
+        mean, stderr = get_average_cell_frequencies(100, image_stack, mask)
 
-    plot_cell_frequencies(mean, stderr)
-    plot_frequency_distribution(frequencies)
+        frequencies = get_cell_frequency_distribution(image_stack, mask)
+
+        plot_cell_frequencies(mean, stderr)
+        plot_frequency_distribution(frequencies)
+    else:
+        means = []
+        stds = []
+        frequencies = []
+        labels = []
+        for idx, path in enumerate(args.path):
+            print(f"Processing {idx + 1} of {len(args.path)}")
+            image_stack = load_image_stack(path)
+            print("Loaded image stack")
+            mask, _, _ = run_cellpose_on_stack(
+                image_stack,
+                save_dir=os.path.join(
+                    results_dir, path.split("/")[-1], f"cellpose_{idx}"
+                ),
+            )
+            print("Ran cellpose")
+
+            mean, stderr = get_average_cell_frequencies(100, image_stack, mask)
+            print("Got average cell frequencies")
+            means.append(mean)
+            stds.append(stderr)
+            frequencies.append(frequencies)
+            labels.append(path.split("/")[-1])
+
+        plot_cell_frequencies(means, stds, labels=labels, path="cell_frequencies.png")
+
+
+if __name__ == "__main__":
+    main()

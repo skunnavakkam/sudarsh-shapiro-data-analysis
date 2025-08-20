@@ -5,20 +5,29 @@ import warnings
 from skimage.color import label2rgb
 from scipy.ndimage import gaussian_filter1d
 from skimage.measure import regionprops
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, peak_widths
 from scipy.optimize import curve_fit
-from typing import TypedDict
-
+from typing import TypedDict, List, Dict, Any, Tuple
+import os
+from scipy.signal import savgol_filter
+import argparse
+from mat_to_img import get_image_stack
+import json
 
 warnings.filterwarnings("ignore")
 
 
 class CellStats(TypedDict):
-    a_mean: float | None
-    a_std: float | None
-    tau_mean: float | None
-    tau_std: float | None
-    n_spikes: int | None
+    tau_rise_mean: float
+    tau_rise_std: float
+    tau_decay_mean: float
+    tau_decay_std: float
+    amplitude_mean: float
+    amplitude_std: float
+    mean_intensity: float
+    std_intensity: float
+    n_spikes: int
+    spike_times: list[int]
 
 
 def load_stack(path: str) -> np.ndarray:
@@ -31,13 +40,15 @@ def get_cells(
     corr_thresh: float = 0.999,
     log_txt: bool = False,
     log_img: bool = False,
+    log_path: str = None,
 ) -> np.ndarray:
     """
     1) Threshold on the max-projection.
     2) Build a graph: nodes = thresholded pixels;
        edges between 8-neighbors only if corr(ts_i, ts_j) > corr_thresh.
-    3) Find connected components in that graph => one “cell” per component.
-    4) Overlay each cell in a distinct color on the binary mask.
+    3) Find connected components in that graph => one "cell" per component.
+    4) Split components at narrow isthmuses using morphological operations
+    5) Overlay each cell in a distinct color on the binary mask.
 
     Returns
     -------
@@ -81,13 +92,26 @@ def get_cells(
                 if 0 <= ny < H and 0 <= nx < W:
                     j = index_map[ny, nx]
                     if j >= 0:
-                        # only compute corr for this neighbor pair
+                        # Check for narrow connection by looking at a larger neighborhood
+                        neighbor_count = 0
+                        for dy2 in (-2, -1, 0, 1, 2):
+                            for dx2 in (-2, -1, 0, 1, 2):
+                                if dy2 == 0 and dx2 == 0:
+                                    continue
+                                ny2, nx2 = y + dy2, x + dx2
+                                if 0 <= ny2 < H and 0 <= nx2 < W and mask[ny2, nx2]:
+                                    neighbor_count += 1
 
-                        c = np.dot(ts[:, i], ts[:, j]) / (
-                            np.linalg.norm(ts[:, i]) * np.linalg.norm(ts[:, j])
-                        )
-                        if c > corr_thresh:
-                            neighbors[i].append(j)
+                        # Only connect if there's a substantial neighborhood (not a narrow connection)
+                        if (
+                            neighbor_count >= 15
+                        ):  # Require more filled pixels in 5x5 neighborhood
+                            # Compute correlation
+                            c = np.dot(ts[:, i], ts[:, j]) / (
+                                np.linalg.norm(ts[:, i]) * np.linalg.norm(ts[:, j])
+                            )
+                            if c > corr_thresh:
+                                neighbors[i].append(j)
 
     # 4) graph connected‐component labeling
     visited = np.zeros(P, bool)
@@ -152,7 +176,8 @@ def get_cells(
         plt.title("Spatial‐Temporal Cells Overlaid on Thresholded Mask")
         plt.axis("off")
         plt.tight_layout()
-        plt.show()
+        plt.savefig(log_path)
+        plt.close()
 
     num_timestamps = stack.shape[0]
 
@@ -209,240 +234,325 @@ def generate_time_series_plot(cell_intensities: np.ndarray, fraction=0.2):
     plt.show()
 
 
+def _rise_func(t, A, tau, baseline):
+    return baseline + A * (1 - np.exp(-t / tau))
+
+
+def _decay_func(t, A, tau, baseline):
+    return baseline + A * np.exp(-t / tau)
+
+
 def analyze_spikes(
     cell_intensities: np.ndarray,
-    sampling_rate: float = 1.0,
-    smooth_sigma: float = 2.0,
-    prominence: float = 10,
-    amplitude_thresh: float = 0.1,
-    fit_thresh: float = 0.9,
-    plot: bool = True,
-    plot_fraction: float = 0.2,
-) -> tuple[list[list[tuple[list[float], list[float], list[float]]]], list[CellStats]]:
-    """Analyze calcium spikes in cell intensity traces.
+    path: str,
+):
+    """Analyze calcium spikes by separately fitting the rise (on) from onset to peak,
+    and the decay (off) from peak to the next onset point or end of trace.
 
-    Parameters
-    ----------
-    cell_intensities : np.ndarray
-        Array of shape (n_cells, n_timepoints) containing intensity values
-    sampling_rate : float
-        Samples per second
-    smooth_sigma : float
-        Gaussian σ for pre-smoothing
-    prominence : float
-        Minimum peak prominence
-    amplitude_thresh : float
-        Absolute threshold for peaks
-    fit_thresh : float
-        Minimum R² value for accepting a fit
-    plot : bool
-        Whether to generate plots
-
-    Returns
-    -------
-    all_fits : list
-        List of fits for each cell
-    all_stats : list
-        List of statistics for each cell
+    Returns:
+        spiking_idxs: list of cell indices with consistent peaks
+        stats: list of stats dict per cell
     """
+    n_cells, _ = cell_intensities.shape
+    unfiltered = cell_intensities.copy()
+    cell_intensities = gaussian_filter1d(cell_intensities, sigma=6, axis=1)
+    os.makedirs(path, exist_ok=True)
 
-    def _kernel(x: np.ndarray, a: float, tau: float, c: float, d: float) -> np.ndarray:
-        """a · (x-d) · exp(-(x-d)/τ) + c, with x ≥ d assumed."""
-        return a * (x - d) * np.exp(-(x - d) / tau) + c
+    spiking_idxs = []
+    stats = []
 
-    all_fits = []
-    all_stats = []
+    for idx in range(n_cells):
+        y = cell_intensities[idx]
+        t = np.arange(len(y))
+        # Remove baseline
+        coeffs = np.polyfit(t, y, 3)
+        baseline = np.polyval(coeffs, t)
+        y = y - baseline
+        y -= np.min(y)
 
-    if plot:
-        n_cells_to_plot = int(cell_intensities.shape[0] * plot_fraction)
-        n_rows = int(np.ceil(n_cells_to_plot / 3))  # 3 columns
-        fig, axes = plt.subplots(n_rows, 3, figsize=(15, 4 * n_rows))
-        axes = axes.flatten()
-
-    for cell_idx in range(cell_intensities.shape[0]):
-        trace = cell_intensities[cell_idx]
-        t = np.arange(len(trace)) / sampling_rate
-        smooth = gaussian_filter1d(trace, sigma=smooth_sigma)
-
-        # Find peaks
+        # Detect peaks
+        clipped = np.clip(y, np.min(y), np.percentile(y, 95))
+        noise = np.std(clipped)
+        height_thresh = max(1.5 * noise, 30)
         peaks, _ = find_peaks(
-            smooth, prominence=prominence, distance=5, height=amplitude_thresh
+            y, prominence=height_thresh, height=np.mean(y) + height_thresh, distance=20
         )
 
-        # Find onset points
-        onset_points = []
-        for peak in peaks:
-            search_start = max(0, peak - 30)
-            window = smooth[search_start : peak + 1]
-            derivatives = np.diff(window)
-            max_deriv_idx = np.argmax(derivatives)
-            onset_idx = search_start + max_deriv_idx
-            onset_points.append(onset_idx)
+        # Uniformity check
+        if len(peaks) > 2:
+            widths, _, _, _ = peak_widths(y, peaks, rel_height=0.5)
+            heights = y[peaks]
+            if np.all(np.abs(widths - widths.mean()) / widths.mean() <= 0.3) and np.all(
+                np.abs(heights - heights.mean()) / heights.mean() <= 0.3
+            ):
+                spiking_idxs.append(idx)
 
-        onset_points = np.array(onset_points)
+        # Find onset points for each peak
+        onset_pts = []
+        if len(peaks) > 2:
+            for p in peaks:
+                start = max(0, p - 70)
+                seg = y[start : p + 1]
+                onset_pts.append(start + np.argmin(seg))
 
-        # Analyze segments
-        segments = []
-        segment_fits = []
-
-        for i in range(len(onset_points)):
-            start = onset_points[i]
-            if i < len(onset_points) - 1:
-                end = min(onset_points[i + 1], start + 50)
+        # Fit kinetics: rise and decay
+        rise_taus, decay_taus, amps = [], [], []
+        rise_fits, decay_fits = [], []
+        for i, p in enumerate(peaks):
+            # Rise fit
+            if onset_pts and i < len(onset_pts):
+                o = onset_pts[i]
+                t_r = np.arange(p - o)
+                y_r = y[o:p]
+                if len(t_r) > 2:
+                    w = np.linspace(0.3, 1.0, len(t_r)) ** 2
+                    try:
+                        amp0 = y_r[-1] - y_r[0]
+                        popt_r, _ = curve_fit(
+                            _rise_func,
+                            t_r,
+                            y_r,
+                            p0=[amp0, len(t_r) / 3, y_r[0]],
+                            bounds=(
+                                [amp0 * 0.8, 1, y_r[0] - 2],
+                                [amp0 * 1.2, len(t_r) * 2, y_r[0] + 2],
+                            ),
+                            sigma=1 / w,
+                            absolute_sigma=False,
+                        )
+                        rise_taus.append(popt_r[1])
+                        amps.append(popt_r[0])
+                        rise_fits.append((o, p, _rise_func(t_r, *popt_r)))
+                    except:
+                        rise_fits.append(None)
+                else:
+                    rise_fits.append(None)
             else:
-                end = min(len(smooth), start + 50)
+                rise_fits.append(None)
 
-            t_segment = t[start:end]
-            y_segment = smooth[start:end]
+            # Decay fit: until next onset or end of trace
+            if onset_pts and i < len(peaks):
+                # define end of decay segment
+                end_pt = onset_pts[i + 1] if (i + 1 < len(onset_pts)) else len(y)
+                max_len = end_pt - p
+                if max_len > 2:
+                    t_d = np.arange(max_len)
+                    y_d = y[p : p + max_len]
+                    try:
+                        popt_d, _ = curve_fit(
+                            _decay_func,
+                            t_d,
+                            y_d,
+                            p0=[y_d[0] - y_d[-1], max_len / 3, y_d[-1]],
+                            bounds=(
+                                [0, 0.5, -np.inf],
+                                [(y_d[0] - y_d[-1]) * 3, max_len * 2, np.inf],
+                            ),
+                        )
+                        decay_taus.append(popt_d[1])
+                        decay_fits.append(
+                            (p, p + max_len, _decay_func(np.arange(max_len), *popt_d))
+                        )
+                    except:
+                        decay_fits.append(None)
+                else:
+                    decay_fits.append(None)
 
-            if len(t_segment) < 10:
-                continue
+        # Compile stats
+        if rise_taus and decay_taus and amps:
+            # Remove outliers using IQR method
+            rise_q1, rise_q3 = np.percentile(rise_taus, [25, 75])
+            rise_iqr = rise_q3 - rise_q1
+            rise_mask = (rise_taus >= rise_q1 - 1.5 * rise_iqr) & (
+                rise_taus <= rise_q3 + 1.5 * rise_iqr
+            )
+            filtered_rise_taus = np.array(rise_taus)[rise_mask]
 
-            try:
-                peak_val = np.max(y_segment)
-                baseline = np.min(y_segment)
-                a0 = (peak_val - baseline) / (t_segment[1] - t_segment[0])
-                tau0 = (t_segment[-1] - t_segment[0]) / 3
-                d0 = t_segment[0]
+            decay_q1, decay_q3 = np.percentile(decay_taus, [25, 75])
+            decay_iqr = decay_q3 - decay_q1
+            decay_mask = (decay_taus >= decay_q1 - 1.5 * decay_iqr) & (
+                decay_taus <= decay_q3 + 1.5 * decay_iqr
+            )
+            filtered_decay_taus = np.array(decay_taus)[decay_mask]
 
-                p0 = [a0, tau0, baseline, d0]
-                bounds = (
-                    [0, 0.001, -np.inf, t_segment[0] - 1],
-                    [np.inf, 1000, np.inf, t_segment[0] + 1],
-                )
-
-                popt, _ = curve_fit(
-                    _kernel, t_segment, y_segment, p0=p0, bounds=bounds, maxfev=2000
-                )
-
-                y_fit = _kernel(t_segment, *popt)
-                residuals = y_segment - y_fit
-                ss_res = np.sum(residuals**2)
-                ss_tot = np.sum((y_segment - np.mean(y_segment)) ** 2)
-                r_squared = 1 - (ss_res / ss_tot)
-
-                if r_squared >= fit_thresh and 0 < popt[1] < 1000:
-                    segments.append((t_segment, y_segment))
-                    segment_fits.append((popt, t_segment, y_fit))
-
-            except RuntimeError:
-                continue
-
-        # Calculate statistics
-        if segment_fits:
-            a_values = [fit[0][0] for fit in segment_fits]
-            tau_values = [fit[0][1] for fit in segment_fits]
-            stats = {
-                "a_mean": np.mean(a_values),
-                "a_std": np.std(a_values),
-                "tau_mean": np.mean(tau_values),
-                "tau_std": np.std(tau_values),
-                "n_spikes": len(segment_fits),
-            }
+            stats.append(
+                {
+                    "tau_rise_mean": float(np.mean(filtered_rise_taus)),
+                    "tau_rise_std": float(np.std(filtered_rise_taus))
+                    if len(filtered_rise_taus) > 1
+                    else 0.0,
+                    "tau_decay_mean": float(np.mean(filtered_decay_taus)),
+                    "tau_decay_std": float(np.std(filtered_decay_taus))
+                    if len(filtered_decay_taus) > 1
+                    else 0.0,
+                    "amplitude_mean": float(np.mean(amps)),
+                    "amplitude_std": float(np.std(amps)) if len(amps) > 1 else 0.0,
+                    "n_spikes": len(peaks),
+                    "spike_times": peaks.tolist(),
+                    "mean_intensity": float(np.mean(unfiltered[idx])),
+                    "std_intensity": float(np.std(unfiltered[idx])),
+                }
+            )
         else:
-            stats = {
-                "a_mean": np.nan,
-                "a_std": np.nan,
-                "tau_mean": np.nan,
-                "tau_std": np.nan,
-                "n_spikes": 0,
-            }
+            stats.append(
+                {
+                    **{
+                        k: None
+                        for k in [
+                            "tau_rise_mean",
+                            "tau_rise_std",
+                            "tau_decay_mean",
+                            "tau_decay_std",
+                            "amplitude_mean",
+                            "amplitude_std",
+                        ]
+                    },
+                    **{
+                        "n_spikes": None,
+                        "spike_times": None,
+                        "mean_intensity": None,
+                        "std_intensity": None,
+                    },
+                }
+            )
 
-        all_fits.append(segment_fits)
-        all_stats.append(stats)
+        # Plot
+        plt.figure()
+        plt.plot(y, label="Raw Data", alpha=0.7)
+        if len(peaks) > 0:
+            plt.plot(peaks, y[peaks], "rx", label="Peaks")
+        if onset_pts:
+            onset_arr = np.array(onset_pts)
+            plt.plot(onset_arr, y[onset_arr], "go", label="Onset Points")
+        # rise fits
+        for fit in rise_fits:
+            if fit is not None:
+                o, p, f = fit
+                plt.plot(np.arange(o, p), f, linewidth=2, alpha=0.8)
+        # decay fits
+        for fit in decay_fits:
+            if fit is not None:
+                p, end, f = fit
+                plt.plot(np.arange(p, end), f, linewidth=2, alpha=0.8)
 
-        if plot and cell_idx < n_cells_to_plot:
-            ax = axes[cell_idx]
-            ax.plot(t, smooth, "b-", label="Smoothed trace")
-            if len(onset_points):
-                ax.plot(
-                    t[onset_points], smooth[onset_points], "g.", label="Onset points"
-                )
-                ax.plot(t[peaks], smooth[peaks], "r.", label="Peaks")
-                # Plot fits
-                for fit_params, t_seg, y_fit in segment_fits:
-                    ax.plot(t_seg, y_fit, "m-", alpha=0.5)
-            else:
-                # Color background light red if no spikes detected
-                ax.set_facecolor("#ffeded")
-            ax.set_title(f"Cell {cell_idx + 1} - {stats['n_spikes']} spikes detected")
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Intensity")
-            ax.legend()
+        plt.text(
+            0.5,
+            0.95,
+            f"Height thresh: {height_thresh:.2f}",
+            transform=plt.gca().transAxes,
+        )
+        plt.legend()
+        plt.title(f"Cell {idx} - Spike Analysis")
+        plt.xlabel("Time (frames)")
+        plt.ylabel("Intensity (baseline corrected)")
+        plt.savefig(os.path.join(path, f"cell_{idx}_analysis.png"), dpi=150)
+        plt.close()
 
-    if plot:
-        # Hide any unused subplots
-        for idx in range(n_cells_to_plot, len(axes)):
-            axes[idx].set_visible(False)
-        plt.tight_layout()
-        plt.show()
+    return spiking_idxs, stats
 
-    return all_fits, all_stats
+
+def make_boxplot(
+    rise_times: list[float], decay_times: list[float], title: str, path: str
+):
+    """Generate violin plots with overlaid data points for rise and decay times.
+
+    Args:
+        rise_times: List of float values for rise times
+        decay_times: List of float values for decay times
+        path: Path to save the figure
+    """
+    plt.figure(figsize=(8, 6))
+
+    # Create violin plots to show distributions
+    plt.violinplot([rise_times, decay_times], showmeans=True)
+
+    # Add individual points with slight horizontal jitter
+    x_jitter1 = np.random.normal(1, 0.05, size=len(rise_times))
+    x_jitter2 = np.random.normal(2, 0.05, size=len(decay_times))
+    plt.scatter(x_jitter1, rise_times, alpha=0.4, c="black", s=20)
+    plt.scatter(x_jitter2, decay_times, alpha=0.4, c="black", s=20)
+
+    plt.title(title)
+    plt.ylabel("Time (frames)")
+    plt.xticks([1, 2], ["Rise Times", "Decay Times"])
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 
 if __name__ == "__main__":
-    image_stack = load_stack(
-        "images/xAM_data_processing_Sudarsh/mT89_re2_DMEM_2025-04-18@20-27-57.tif"
+    CACHE_DIR = "cache"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--path",
+        type=str,
+        required=True,
+        help="Path to the image stack, either a single tif or a folder of .mat files",
+    )
+    args = parser.parse_args()
+
+    # Create results directory with filename
+    results_dir = os.path.join("results", os.path.basename(args.path).replace(".", "+"))
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Check if cached version exists
+    cache_path = os.path.join(
+        CACHE_DIR, os.path.basename(args.path).replace(".", "+") + ".npy"
+    )
+    if os.path.exists(cache_path):
+        print(f"Loading cached data from {cache_path}")
+        cell_intensities = np.load(cache_path)
+
+    else:
+        if os.path.isdir(args.path):
+            image_stack = get_image_stack(args.path)
+            cell_intensities = get_cells(
+                image_stack,
+                log_img=True,
+                log_path=os.path.join(results_dir, "cells.png"),
+            )
+            cell_intensities = gaussian_filter1d(cell_intensities, sigma=2, axis=1)
+            np.save(cache_path, cell_intensities)
+        else:
+            image_stack = load_stack(args.path)
+            cell_intensities = get_cells(
+                image_stack,
+                log_img=True,
+                log_path=os.path.join(results_dir, "cells.png"),
+            )
+            cell_intensities = gaussian_filter1d(cell_intensities, sigma=2, axis=1)
+            np.save(cache_path, cell_intensities)
+
+    spiking_idxs, stats = analyze_spikes(
+        cell_intensities,
+        path=os.path.join(results_dir, "spikes"),
     )
 
-    cell_intensities = get_cells(image_stack)
-    cell_intensities = gaussian_filter1d(cell_intensities, sigma=1, axis=1)
+    cell_rises = [
+        cell_stats["tau_rise_mean"]
+        for cell_stats in stats
+        if cell_stats["tau_rise_mean"] is not None
+    ]
 
-    generate_time_series_plot(cell_intensities)
-    fits, stats = analyze_spikes(cell_intensities)
+    cell_decays = [
+        cell_stats["tau_decay_mean"]
+        for cell_stats in stats
+        if cell_stats["tau_decay_mean"] is not None
+    ]
 
-    # Check for cells with no spikes detected
-    cells_with_no_spikes = sum(1 for stat in stats if stat["n_spikes"] == 0)
-    print(f"\nNumber of cells with no spikes detected: {cells_with_no_spikes}")
+    try:
+        make_boxplot(
+            cell_rises,
+            cell_decays,
+            f"Rise and Decay Times for {os.path.basename(args.path.replace('.tif', ''))}",
+            os.path.join(results_dir, "rise_decay_times.png"),
+        )
+    except Exception as e:
+        print(f"Error making boxplot: {e}")
 
-    tau_mean = [stats["tau_mean"] for stats in stats]
-    tau_std = [stats["tau_std"] for stats in stats]
-    a_mean = [stats["a_mean"] for stats in stats]
-    a_std = [stats["a_std"] for stats in stats]
-
-    # Remove outliers using IQR method
-    def remove_outliers(data):
-        if not all(np.isnan(x) for x in data):
-            q1 = np.nanpercentile(data, 25)
-            q3 = np.nanpercentile(data, 75)
-            iqr = q3 - q1
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-            return [
-                x if (not np.isnan(x) and lower_bound <= x <= upper_bound) else np.nan
-                for x in data
-            ]
-        return data
-
-    # Apply outlier removal to each parameter
-    tau_mean = remove_outliers(tau_mean)
-    tau_std = remove_outliers(tau_std)
-    a_mean = remove_outliers(a_mean)
-    a_std = remove_outliers(a_std)
-
-    # Create figure with 2x2 subplots for parameter distributions
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
-
-    # Plot histograms of fitted parameters
-    ax1.hist(tau_mean, bins=20)
-    ax1.set_title("Distribution of Mean τ")
-    ax1.set_xlabel("τ (seconds)")
-    ax1.set_ylabel("Count")
-
-    ax2.hist(tau_std, bins=20)
-    ax2.set_title("Distribution of τ Standard Deviation")
-    ax2.set_xlabel("τ (seconds)")
-    ax2.set_ylabel("Count")
-
-    ax3.hist(a_mean, bins=20)
-    ax3.set_title("Distribution of Mean Amplitude")
-    ax3.set_xlabel("Amplitude")
-    ax3.set_ylabel("Count")
-
-    ax4.hist(a_std, bins=20)
-    ax4.set_title("Distribution of Amplitude Standard Deviation")
-    ax4.set_xlabel("Amplitude")
-    ax4.set_ylabel("Count")
-
-    plt.tight_layout()
-    plt.show()
+    with open(os.path.join(results_dir, "stats.json"), "w") as f:
+        json.dump(stats, f)

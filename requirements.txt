@@ -4,4 +4,4 @@ scipy
 scikit-image
 matplotlib
 numpy
-pandas
+pandastifffile
